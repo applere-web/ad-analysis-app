@@ -8,8 +8,8 @@ import io
 
 # --- 页面配置 ---
 st.set_page_config(
-    page_title="电商广告AI全盘分析系统 V2.0",
-    page_icon="🛍️",
+    page_title="Shopee/TikTok/Lazada 广告分析 V3.0",
+    page_icon="🛒",
     layout="wide"
 )
 
@@ -17,12 +17,12 @@ st.set_page_config(
 st.sidebar.title("🔧 设置中心")
 api_key = st.sidebar.text_input("请输入 Google Gemini API Key:", type="password")
 st.sidebar.markdown("---")
-st.sidebar.info("V2.0 更新：\n1. 支持全量数据读取\n2. 自动修复文件格式错误\n3. 自动清洗货币符号")
+st.sidebar.info("V3.0 更新：\n1. 自动识别 Shopee 报表格式\n2. 自动跳过顶部的店铺信息行\n3. 针对 GMV Max 和 Bidding Manual 进行优化")
 
 # --- 核心函数：连接 AI ---
 def get_gemini_response(prompt, image=None):
     if not api_key:
-        return "⚠️ 请先输入 API Key"
+        return "⚠️ 请先在侧边栏输入 API Key"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
     headers = {'Content-Type': 'application/json'}
@@ -30,7 +30,7 @@ def get_gemini_response(prompt, image=None):
 
     if image:
         buffered = io.BytesIO()
-        image.save(buffered, format="JPEG", quality=80) # 压缩图片以加快速度
+        image.save(buffered, format="JPEG", quality=80)
         img_str = base64.b64encode(buffered.getvalue()).decode()
         contents_parts.append({
             "inline_data": {
@@ -42,7 +42,6 @@ def get_gemini_response(prompt, image=None):
     payload = {"contents": [{"parts": contents_parts}]}
 
     try:
-        # 增加 timeout 防止数据量太大时断开
         response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
         if response.status_code == 200:
             result = response.json()
@@ -55,95 +54,134 @@ def get_gemini_response(prompt, image=None):
     except Exception as e:
         return f"❌ 网络/超时错误: {str(e)}"
 
-# --- 辅助函数：智能读取文件 ---
-def load_data(uploaded_file):
+# --- 核心函数：智能读取 Shopee 报表 ---
+def load_shopee_data(uploaded_file):
     try:
-        # 方法 1: 尝试作为 Excel 读取
-        if uploaded_file.name.endswith('.xlsx') or uploaded_file.name.endswith('.xls'):
-            return pd.read_excel(uploaded_file)
+        # 1. 先把文件读进来，不设表头，看前20行
+        if uploaded_file.name.endswith('.csv'):
+            # 尝试多种编码，防止印尼语/中文乱码
+            try:
+                df_temp = pd.read_csv(uploaded_file, header=None, nrows=20, encoding='utf-8')
+            except:
+                uploaded_file.seek(0)
+                df_temp = pd.read_csv(uploaded_file, header=None, nrows=20, encoding='latin1')
+        else:
+            df_temp = pd.read_excel(uploaded_file, header=None, nrows=20)
         
-        # 方法 2: 尝试作为标准 CSV 读取
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file)
-        except:
-            pass
-            
-        # 方法 3: 遇到 "Expected 2 fields" 错误时，尝试忽略错误行并自动推断分隔符
-        uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file, sep=None, engine='python', on_bad_lines='skip')
+        # 2. 寻找真正的表头行
+        # 我们找包含 'Nama Iklan' (广告名) 或 'Status' (状态) 的那一行
+        header_row_index = -1
+        for i, row in df_temp.iterrows():
+            row_str = row.astype(str).values.tolist()
+            # 只要这一行里同时出现了 "Status" 或者 "Nama Iklan" 或者 "Ad Name"，就认为是表头
+            if any("Nama Iklan" in str(x) for x in row_str) or any("Ad Name" in str(x) for x in row_str):
+                header_row_index = i
+                break
         
+        # 3. 如果没找到，就默认第0行；如果找到了，就从那一行重新读取
+        uploaded_file.seek(0) # 回到文件开头
+        
+        if header_row_index != -1:
+            st.toast(f"✅ 已自动识别表头在第 {header_row_index + 1} 行，正在裁切数据...", icon="✂️")
+            if uploaded_file.name.endswith('.csv'):
+                try:
+                    df = pd.read_csv(uploaded_file, header=header_row_index, encoding='utf-8')
+                except:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, header=header_row_index, encoding='latin1')
+            else:
+                df = pd.read_excel(uploaded_file, header=header_row_index)
+        else:
+            st.warning("⚠️ 未能自动定位表头，尝试标准读取...")
+            if uploaded_file.name.endswith('.csv'):
+                 df = pd.read_csv(uploaded_file)
+            else:
+                 df = pd.read_excel(uploaded_file)
+
+        return df
+
     except Exception as e:
         return None
 
 # --- 主页面 ---
-st.title("🛍️ 电商广告全量数据 AI 大脑")
-st.caption("支持 Shopee / Lazada / TikTok 导出报表 | 自动清洗数据 | 全盘运算")
+st.title("🛒 Shopee/Lazada 智能广告报表分析")
+st.caption("专为 Shopee 印尼/马来/台湾站点优化 | 自动识别 GMV Max 与 ROI")
 
-# --- 模块 1: 强壮的数据上传 ---
-st.header("1. 导入数据")
-uploaded_file = st.file_uploader("直接上传平台导出的原始表格", type=['csv', 'xlsx', 'xls'])
+# --- 模块 1: 数据上传 ---
+st.header("1. 上传报表 (Excel/CSV)")
+uploaded_file = st.file_uploader("请直接上传 Shopee 导出的原始文件 (无需删除前几行)", type=['csv', 'xlsx', 'xls'])
 
 if uploaded_file is not None:
-    df = load_data(uploaded_file)
+    df = load_shopee_data(uploaded_file)
     
     if df is None:
-        st.error("❌ 文件读取彻底失败。请尝试将文件在 Excel 中打开，‘另存为’ -> 选择 'Excel 工作簿 (*.xlsx)' 格式后再上传。")
+        st.error("❌ 文件读取失败。请确保文件是 Excel (.xlsx) 或 CSV 格式。")
     else:
-        # 数据清洗：把所有看起来像数字的列（含%, $等）转为纯数字，方便AI理解
-        st.success(f"✅ 成功读取！共 {len(df)} 行数据。正在进行全量分析准备...")
+        # 数据清洗：删除完全为空的列
+        df = df.dropna(how='all', axis=1)
         
-        st.dataframe(df.head(3)) # 只展示前3行给您看，但会发所有数据给AI
+        st.success(f"✅ 读取成功！有效数据共 {len(df)} 条。")
+        st.write("### 📊 数据预览 (已自动修正表头)")
+        st.dataframe(df.head(5))
 
-        # --- 模块 2: 全量 AI 分析 ---
-        st.header("2. AI 全盘运算")
+        # --- 模块 2: AI 分析 ---
+        st.header("2. AI 深度分析")
         
-        analysis_mode = st.radio("您想让 AI 做什么？", 
-            ["全盘诊断 (哪个停哪个投)", "逆推高 ROI 模式", "未来趋势预测", "关键词深度挖掘"], horizontal=True)
+        analysis_mode = st.selectbox("选择分析维度", 
+            ["综合诊断：哪些要停？哪些要加码？", 
+             "GMV Max 效果专项分析", 
+             "Bidding Manual (手动出价) 关键词优化", 
+             "高 ROI (Efektivitas) 逆推模式"])
         
-        if st.button("🚀 启动 AI 全量运算"):
-            with st.spinner("AI 正在阅读所有数据行，这可能需要几秒钟..."):
-                # 将数据转换为 CSV 文本
-                # 技巧：如果数据量超过 2000 行，为了防止请求超时，我们保留关键统计信息
-                # 但 Gemini 1.5 Flash 支持 100万 token，我们尽量发全量
+        if st.button("🚀 开始 AI 运算"):
+            with st.spinner("AI 正在分析您的广告花费(Biaya)、销售额(Omzet)和ROI(Efektivitas)..."):
                 
-                # 将整个 DataFrame 转为字符串
-                full_data_str = df.to_csv(index=False)
+                # 数据截取与转换
+                full_data_str = df.head(3000).to_csv(index=False)
                 
-                # 检查字数，如果超过 80万字符（约等于限制），进行截断保护
-                if len(full_data_str) > 800000:
-                    st.warning("⚠️ 数据量极大，已自动截取最重要的前 3000 行进行分析。")
-                    full_data_str = df.head(3000).to_csv(index=False)
-
                 prompt = f"""
-                角色：资深电商数据专家。
-                用户意图：{analysis_mode}
+                角色：Shopee/Lazada 顶级电商运营专家。
+                任务：分析用户上传的广告数据。
+                分析目标：{analysis_mode}
                 
-                这是用户上传的完整广告数据（CSV格式）：
+                **重要：字段对应关系 (Shopee Indonesia)**
+                - Nama Iklan = 广告名称/产品名
+                - Status = 状态
+                - Mode Bidding = 出价模式 (GMV Max / Manual)
+                - Dilihat = 浏览量 (Impressions)
+                - Jumlah Klik = 点击量 (Clicks)
+                - Persentas Klik = 点击率 (CTR)
+                - Biaya = 花费 (Cost)
+                - Omzet Penjualan = 销售额 (GMV)
+                - Efektivitas = 投产比 (ROI/ROAS)
+                - Produk Terjual = 销量
                 
+                这是用户的数据样本 (CSV格式):
                 ```csv
                 {full_data_str}
                 ```
                 
-                请根据以上【全部数据】进行运算和分析，不要只看局部。
+                请给出极其具体的**操作建议**：
+                1. **红黑榜**：列出表现最好的 3 个广告 (ROI/Efektivitas 最高)，和表现最差的 3 个广告 (光花钱不出单)。
+                2. **诊断分析**：
+                   - 针对 **GMV Max** 的广告，效果如何？如果不理想，建议是调预算还是关停？
+                   - 针对 **Manual Bidding** 的广告，点击率低是因为图片还是关键词？
+                3. **未来动作**：具体说明哪个 ID 需要【听/暂停】，哪个 ID 需要【增加预算】。
+                4. **趋势逆推**：如果把浪费在差广告上的钱挪给好广告，预估下周销售额增长多少？
                 
-                任务要求：
-                1. **决策建议**：请直接列出这就这几个表现【最好】的广告ID，和必须【立即停止】的广告ID。
-                2. **数据支撑**：解释为什么建议停止？（是因为花费高但GMV为0？还是CTR太低？）
-                3. **逆推与预测**：如果把浪费的预算挪到表现好的广告上，预估下周的 GMV 增长潜力。
-                4. **排版**：请用清晰的列表和加粗字体，不要长篇大论，直接给操作指令。
+                请用**中文**回答，重点突出，不要讲大道理，直接给操作指令。
                 """
                 
                 response_text = get_gemini_response(prompt)
-                st.markdown("### 🧠 AI 分析结论")
+                st.markdown("### 🧠 运营策略建议")
                 st.markdown(response_text)
 
 st.markdown("---")
 
 # --- 模块 3: 图片分析 ---
 st.header("3. 广告图诊断")
-uploaded_img = st.file_uploader("上传广告素材", type=['png', 'jpg', 'jpeg'])
+uploaded_img = st.file_uploader("上传广告图", type=['png', 'jpg', 'jpeg'])
 if uploaded_img and st.button("👁️ 分析图片"):
-    with st.spinner("正在分析视觉..."):
-        res = get_gemini_response("这张图作为电商广告，吸引力够吗？给分0-10。如何修改能提高点击率？", Image.open(uploaded_img))
+    with st.spinner("AI 正在看图..."):
+        res = get_gemini_response("这张图作为Shopee/Lazada的主图，点击率会高吗？给分0-10。有什么缺点？怎么改更吸引人？", Image.open(uploaded_img))
         st.markdown(res)
